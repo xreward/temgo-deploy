@@ -1,0 +1,120 @@
+name: Deploy approved image
+
+on:
+  repository_dispatch:
+    types: [image_published]
+
+permissions: {}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    outputs:
+      service: ${{ steps.request.outputs.service }}
+      commit: ${{ steps.request.outputs.commit }}
+      digest: ${{ steps.request.outputs.digest }}
+    steps:
+      - name: Check release identity
+        id: request
+        env:
+          EXPECTED_APP: ${{ vars.DEPLOY_APP_SLUG }}
+        run: |
+          set -euo pipefail
+          : "${EXPECTED_APP:?Set DEPLOY_APP_SLUG}"
+          jq -e --arg sender "$EXPECTED_APP[bot]" '.sender.login == $sender' "$GITHUB_EVENT_PATH" >/dev/null
+          service=$(jq -er '.client_payload.service' "$GITHUB_EVENT_PATH")
+          case "$service" in
+            frontend) repo=game-commerce-marketplace ;;
+            backend) repo=platform-gateway-api ;;
+            *) exit 1 ;;
+          esac
+          jq -e --arg repo "xreward/$repo" '.client_payload.source_repository == $repo' "$GITHUB_EVENT_PATH" >/dev/null
+          sha=$(jq -er '.client_payload.commit_sha' "$GITHUB_EVENT_PATH")
+          digest=$(jq -er '.client_payload.image_digest' "$GITHUB_EVENT_PATH")
+          run_id=$(jq -er '.client_payload.run_id' "$GITHUB_EVENT_PATH")
+          [[ "$sha" =~ ^[0-9a-f]{40}$ && "$digest" =~ ^sha256:[0-9a-f]{64}$ && "$run_id" =~ ^[1-9][0-9]*$ ]] || exit 1
+          printf 'service=%s\nrepo=%s\ncommit=%s\ndigest=%s\nrun_id=%s\n' "$service" "$repo" "$sha" "$digest" "$run_id" >> "$GITHUB_OUTPUT"
+      - uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        id: reader
+        with:
+          client-id: ${{ vars.BUILD_READER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BUILD_READER_APP_PRIVATE_KEY }}
+          owner: xreward
+          repositories: ${{ steps.request.outputs.repo }}
+          permission-actions: read
+      - name: Verify the private main build and its published digest
+        env:
+          GH_TOKEN: ${{ steps.reader.outputs.token }}
+          REPO: ${{ steps.request.outputs.repo }}
+          RUN_ID: ${{ steps.request.outputs.run_id }}
+          SHA: ${{ steps.request.outputs.commit }}
+          DIGEST: ${{ steps.request.outputs.digest }}
+          SERVICE: ${{ steps.request.outputs.service }}
+        run: |
+          set -euo pipefail
+          endpoint="repos/xreward/$REPO/actions/runs/$RUN_ID"
+          # Dispatch is the producer's last step. Its final status can arrive a little later.
+          for _ in {1..60}; do
+            run=$(gh api "$endpoint")
+            jq -e --arg sha "$SHA" --arg repo "xreward/$REPO" '
+              .event == "push" and .head_branch == "main" and .head_sha == $sha and
+              .head_repository.full_name == $repo and .path == ".github/workflows/build.yaml"
+            ' <<< "$run" >/dev/null
+            if [[ $(jq -r .status <<< "$run") == completed ]]; then break; fi
+            sleep 5
+          done
+          jq -e '.status == "completed" and .conclusion == "success"' <<< "$run" >/dev/null
+          name="image-${DIGEST#sha256:}"
+          gh api "$endpoint/artifacts?name=$name" | jq -e --arg name "$name" \
+            'any(.artifacts[]; .name == $name and .expired == false)' >/dev/null
+          printf '### Review %s for production\n\nCommit `%s`\n\nImage `%s`\n\n[Verified build](https://github.com/xreward/%s/actions/runs/%s)\n' \
+            "$SERVICE" "$SHA" "$DIGEST" "$REPO" "$RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy ${{ needs.verify.outputs.service }} at ${{ needs.verify.outputs.commit }}
+    needs: verify
+    environment: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+    concurrency:
+      group: temgo-production
+      queue: max
+    env:
+      SERVICE: ${{ needs.verify.outputs.service }}
+      SHA: ${{ needs.verify.outputs.commit }}
+      DIGEST: ${{ needs.verify.outputs.digest }}
+      INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ap-northeast-2
+          mask-aws-account-id: true
+      - name: Verify ECR and update the service
+        run: |
+          set -euo pipefail
+          stored=$(aws ecr describe-images --repository-name "temgo-prd-$SERVICE" --image-ids "imageTag=sha-$SHA" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          [[ "$stored" == "$DIGEST" ]] || { echo "::error::ECR digest does not match the approved build"; exit 1; }
+          params=$(jq -nc --arg s "$SERVICE" --arg c "$SHA" --arg d "$DIGEST" '{Service:[$s],CommitSha:[$c],Digest:[$d]}')
+          command_id=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name TemGO-DeployImage \
+            --parameters "$params" --timeout-seconds 120 --comment "Approved TemGO deployment, GitHub run $GITHUB_RUN_ID" \
+            --query 'Command.CommandId' --output text)
+          printf 'SSM command `%s`\n' "$command_id" >> "$GITHUB_STEP_SUMMARY"
+          for _ in {1..150}; do
+            if status=$(aws ssm get-command-invocation --instance-id "$INSTANCE_ID" --command-id "$command_id" \
+                --query Status --output text 2>"$RUNNER_TEMP/ssm-error"); then
+              case "$status" in
+                Success) echo "Deployment and HTTPS health check passed." >> "$GITHUB_STEP_SUMMARY"; exit 0 ;;
+                Pending|InProgress|Delayed) ;;
+                *) echo "::error::SSM returned $status. Inspect the command in AWS."; exit 1 ;;
+              esac
+            elif ! grep -q 'InvocationDoesNotExist' "$RUNNER_TEMP/ssm-error"; then
+              echo "::error::Could not read SSM command status"; exit 1
+            fi
+            sleep 5
+          done
+          echo "::error::Timed out waiting for SSM"; exit 1
